@@ -119,7 +119,7 @@
                             </td>
                             <td>{{ task.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
                             <td>
-                                {% if task.status == 'Completed' %}
+                                {% if 'Completed' in task.status %}
                                     <span class="badge bg-success task-status">Selesai Render</span>
                                 {% elif 'Downloading' in task.status %}
                                     <span class="badge bg-warning text-dark task-status" data-active="true">{{ task.status }}</span>
@@ -130,7 +130,7 @@
                                 {% endif %}
                             </td>
                             <td>
-                                {% if task.status == 'Completed' %}
+                                {% if 'Completed' in task.status %}
                                     <a href="{{ url_for('view_site', folder_name=task.folder_name) }}" target="_blank" class="btn btn-sm btn-outline-success">Buka Hasil Arsip</a>
                                 {% else %}
                                     <button class="btn btn-sm btn-outline-secondary" disabled>Proses...</button>

@@ -1,11 +1,12 @@
 import os
 import re
+import json
 import glob
 import shutil
 import asyncio
 import hashlib
 from collections import deque
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse, urljoin, parse_qs, urlencode, urlunparse
 from datetime import datetime
 from bs4 import BeautifulSoup
 from flask import Flask, render_template, request, redirect, url_for, send_from_directory
@@ -17,6 +18,8 @@ app = Flask(__name__)
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
 DOWNLOAD_FOLDER = os.path.join(BASE_DIR, 'downloads')
 PREVIEW_FOLDER = os.path.join(BASE_DIR, 'static', 'previews')
+AUTH_STATE_PATH = os.path.join(BASE_DIR, 'auth.json')
+COOKIES_TXT_PATH = os.path.join(BASE_DIR, 'cookies.txt')
 
 app.config['SQLALCHEMY_DATABASE_URI'] = f"sqlite:///{os.path.join(BASE_DIR, 'downloader.db')}"
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -37,8 +40,34 @@ with app.app_context():
     os.makedirs(PREVIEW_FOLDER, exist_ok=True)
     db.create_all()
 
+def export_cookies_for_singlefile():
+    if not os.path.exists(AUTH_STATE_PATH):
+        return None
+    try:
+        with open(AUTH_STATE_PATH, 'r', encoding='utf-8') as f:
+            state = json.load(f)
+        cookies = state.get('cookies', [])
+        if not cookies:
+            return None
+
+        lines = ["# Netscape HTTP Cookie File"]
+        for c in cookies:
+            domain = c.get('domain', '')
+            flag = "TRUE" if domain.startswith('.') else "FALSE"
+            path = c.get('path', '/')
+            secure = "TRUE" if c.get('secure', False) else "FALSE"
+            expires = int(c.get('expires', 0))
+            if expires < 0:
+                expires = 0
+            lines.append(f"{domain}\t{flag}\t{path}\t{secure}\t{expires}\t{c.get('name', '')}\t{c.get('value', '')}")
+
+        with open(COOKIES_TXT_PATH, 'w', encoding='utf-8') as f:
+            f.write("\n".join(lines) + "\n")
+        return COOKIES_TXT_PATH
+    except Exception:
+        return None
+
 def find_singlefile_executable():
-    """Mencari path absolut executable single-file"""
     for candidate in [
         shutil.which("single-file"),
         "/usr/bin/single-file",
@@ -50,7 +79,6 @@ def find_singlefile_executable():
     return "single-file"
 
 def find_chromium_executable():
-    """Mencari lokasi binary Chromium milik sistem atau Playwright"""
     if os.path.exists("/usr/local/bin/chromium"):
         return "/usr/local/bin/chromium"
     pw_paths = glob.glob('/home/*/.cache/ms-playwright/chromium-*/chrome-linux*/chrome')
@@ -74,15 +102,22 @@ def get_root_domain(netloc):
     return host
 
 def normalize_url(url):
+    """Menyamakan bentuk URL (hilangkan tracking query, samakan www/non-www & trailing slash)"""
     parsed = urlparse(url.strip())
-    scheme = 'https'
     netloc = parsed.netloc.lower()
+    if netloc.startswith('www.'):
+        netloc = netloc[4:]
     path = parsed.path.rstrip('/')
-    query = f"?{parsed.query}" if parsed.query else ""
-    return f"{scheme}://{netloc}{path}{query}"
+
+    # Filter parameter tracking agar tidak menduplikasi halaman yang sama
+    ignored_params = {'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'fbclid', 'gclid', 'ref'}
+    qs = parse_qs(parsed.query)
+    filtered_qs = {k: v for k, v in sorted(qs.items()) if k.lower() not in ignored_params}
+    query_str = urlencode(filtered_qs, doseq=True)
+
+    return urlunparse(('https', netloc, path, '', query_str, ''))
 
 def url_to_html_filename(url, root_url):
-    """Menghasilkan nama file .html mandiri untuk setiap halaman"""
     if normalize_url(url) == normalize_url(root_url):
         return "index.html"
     parsed = urlparse(url)
@@ -99,9 +134,8 @@ def is_valid_domain_or_subdomain(link, root_domain):
             return False
         if get_root_domain(parsed.netloc) != root_domain:
             return False
-        # Mengizinkan halaman login/SSO publik ikut terarsip
-        excluded_keywords = ['logout', 'cart', 'checkout', 'wp-admin', 'whatsapp']
-        excluded_exts = ('.pdf', '.zip', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.mp4', '.exe', '.webp')
+        excluded_keywords = ['logout', 'signout', 'keluar', 'cart', 'checkout', 'whatsapp', 'mailto:', 'tel:']
+        excluded_exts = ('.pdf', '.zip', '.rar', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.mp4', '.mp3', '.exe', '.webp', '.ico', '.css', '.js', '.json', '.xml')
         lower_link = link.lower()
         if any(k in lower_link for k in excluded_keywords) or parsed.path.lower().endswith(excluded_exts):
             return False
@@ -109,25 +143,13 @@ def is_valid_domain_or_subdomain(link, root_domain):
     except Exception:
         return False
 
-async def prepare_page_for_discovery(page):
-    """Menutup popup/modal dan memicu hover menu untuk menemukan sub-tautan"""
+async def auto_scroll_and_expand(page):
+    """Menggulir halaman dari atas ke bawah & membuka menu dropdown agar seluruh link lazy-load muncul"""
     try:
-        for target_text in ["Kota Semarang", "Semarang", "Tutup", "Close"]:
-            btn = page.get_by_text(target_text).first
-            if await btn.is_visible():
-                await btn.click(timeout=1500)
-                await page.wait_for_load_state('domcontentloaded', timeout=8000)
-                await asyncio.sleep(1)
-                break
-    except Exception:
-        pass
-
-    await page.wait_for_load_state('domcontentloaded')
-
-    try:
-        await page.evaluate("""() => {
+        await page.evaluate("""async () => {
+            // 1. Hapus overlay/modal yang menghalangi
             const selectors = [
-                '.modal', '.modal-backdrop', '.fade.show', 
+                '.modal', '.modal-backdrop', '.fade.show',
                 '[class*="modal"]', '[class*="backdrop"]', '[class*="popup"]', '[class*="overlay"]'
             ];
             selectors.forEach(sel => {
@@ -137,69 +159,109 @@ async def prepare_page_for_discovery(page):
             document.body.style.position = 'static';
             document.documentElement.style.overflow = 'auto';
 
-            const navItems = document.querySelectorAll('nav li, .menu-item, [class*="category"], [class*="nav"] a');
-            navItems.forEach(el => {
+            // 2. Picu hover pada menu navigasi & dropdown
+            document.querySelectorAll('nav li, .menu-item, .dropdown, [class*="category"], [class*="nav"] a').forEach(el => {
                 el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
                 el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
             });
+
+            // 3. Auto-scroll bertahap ke bawah halaman untuk memicu lazy-load
+            const totalHeight = Math.min(document.body.scrollHeight || 3000, 8000);
+            const step = 600;
+            for (let y = 0; y <= totalHeight; y += step) {
+                window.scrollTo(0, y);
+                await new Promise(r => setTimeout(r, 150));
+            }
+            window.scrollTo(0, 0);
         }""")
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.8)
     except Exception:
         pass
 
-async def extract_all_links(page):
-    """Mengekstrak URL dari <a>, atribut SPA (routerlink/data-href), dan simulasi klik tombol navigasi"""
+async def prepare_page_for_discovery(page):
+    try:
+        for target_text in ["Kota Semarang", "Semarang", "Tutup", "Close", "Setuju", "Accept"]:
+            btn = page.get_by_text(target_text).first
+            if await btn.is_visible():
+                await btn.click(timeout=1200)
+                await asyncio.sleep(0.8)
+                break
+    except Exception:
+        pass
+
+    await page.wait_for_load_state('domcontentloaded')
+    await auto_scroll_and_expand(page)
+
+async def extract_all_links(page, enable_button_probe=True):
+    """Mengekstrak seluruh tautan dari DOM (<a>, onclick, data-href, routerlink) + probing tombol SPA"""
     urls = await page.evaluate("""() => {
         const found = new Set();
+
+        // 1. Semua elemen <a href>
         document.querySelectorAll('a[href]').forEach(a => {
-            if (a.href && !a.href.startsWith('javascript:')) {
+            if (a.href && !a.href.startsWith('javascript:') && !a.href.startsWith('mailto:') && !a.href.startsWith('tel:')) {
                 found.add(a.href);
             }
         });
-        document.querySelectorAll('[data-href], [data-url], [routerlink], [ng-reflect-router-link]').forEach(el => {
-            const val = el.getAttribute('data-href') || el.getAttribute('data-url') || el.getAttribute('routerlink') || el.getAttribute('ng-reflect-router-link');
+
+        // 2. Atribut SPA & custom data attributes
+        document.querySelectorAll('[data-href], [data-url], [data-link], [routerlink], [ng-reflect-router-link]').forEach(el => {
+            const val = el.getAttribute('data-href') || el.getAttribute('data-url') || el.getAttribute('data-link') || el.getAttribute('routerlink') || el.getAttribute('ng-reflect-router-link');
             if (val) {
-                try {
-                    found.add(new URL(val, window.location.origin).href);
-                } catch (e) {}
+                try { found.add(new URL(val, window.location.origin).href); } catch (e) {}
             }
         });
+
+        // 3. Pola URL di dalam atribut onclick (misal: location.href='/produk/detail')
+        document.querySelectorAll('[onclick]').forEach(el => {
+            const code = el.getAttribute('onclick') || '';
+            const matches = code.match(/['"]((?:https?:\\/\\/|\\/)[^'"]+)['"]/g);
+            if (matches) {
+                matches.forEach(m => {
+                    const clean = m.slice(1, -1);
+                    try { found.add(new URL(clean, window.location.origin).href); } catch (e) {}
+                });
+            }
+        });
+
         return Array.from(found);
     }""")
 
     discovered_set = set(urls)
     base_url = page.url
 
-    # Simulasi klik tombol interaktif SPA (seperti "Lanjutkan ke Login") untuk menangkap URL redirect
-    try:
-        buttons = await page.locator("button, [role='button'], a.btn").all()
-        for idx in range(min(len(buttons), 10)):
-            try:
-                await page.goto(base_url, wait_until='domcontentloaded', timeout=25000)
-                await asyncio.sleep(2)
-                btn = page.locator("button, [role='button'], a.btn").nth(idx)
-                if await btn.is_visible():
-                    btn_text = (await btn.inner_text()).strip().lower()
-                    if any(skip in btn_text for skip in ['batal', 'cancel', 'tutup', 'close', 'id', 'en']):
-                        continue
-                    await btn.click(timeout=3000)
-                    await asyncio.sleep(3)
+    # 4. Probing tombol SPA (hanya pada depth awal agar tetap cepat namun menembus gerbang SPA)
+    if enable_button_probe:
+        try:
+            buttons = await page.locator("button, [role='button'], a.btn").all()
+            for idx in range(min(len(buttons), 12)):
+                try:
                     if page.url != base_url:
-                        discovered_set.add(page.url)
-                        sub_urls = await page.evaluate("() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)")
-                        discovered_set.update(sub_urls)
-            except Exception:
-                continue
-    except Exception:
-        pass
+                        await page.goto(base_url, wait_until='domcontentloaded', timeout=25000)
+                        await asyncio.sleep(1.5)
+                    btn = page.locator("button, [role='button'], a.btn").nth(idx)
+                    if await btn.is_visible():
+                        btn_text = (await btn.inner_text()).strip().lower()
+                        if any(skip in btn_text for skip in ['batal', 'cancel', 'tutup', 'close', 'logout', 'keluar', 'hapus', 'delete', 'id', 'en']):
+                            continue
+                        await btn.click(timeout=2500)
+                        await asyncio.sleep(2.5)
+                        if page.url != base_url:
+                            discovered_set.add(page.url)
+                            sub_urls = await page.evaluate("() => Array.from(document.querySelectorAll('a[href]')).map(a => a.href)")
+                            discovered_set.update(sub_urls)
+                except Exception:
+                    continue
+        except Exception:
+            pass
 
     return list(discovered_set)
 
-async def bfs_discover_links(page, start_url, max_depth=3, max_pages=50, rate_limit_sec=1.5, task_id=None):
-    """BFS Link Discovery hingga ke subdomain & SPA routes dengan depth limit & rate limiting"""
+async def bfs_discover_links(page, start_url, max_depth=4, max_pages=100, rate_limit_sec=1.2, task_id=None):
+    """Deep BFS Link Discovery dengan prioritas menu navigasi & pengurutan kedalaman"""
     root_domain = get_root_domain(urlparse(start_url).netloc)
     clean_start = normalize_url(start_url)
-    
+
     queue = deque([(start_url.split('#')[0], 0)])
     visited = {clean_start}
     discovered = [start_url.split('#')[0]]
@@ -211,16 +273,21 @@ async def bfs_discover_links(page, start_url, max_depth=3, max_pages=50, rate_li
             with app.app_context():
                 t = db.session.get(DownloadTask, task_id)
                 if t:
-                    t.status = f'Downloading: BFS Crawl (Depth {depth} | {len(discovered)}/{max_pages} URL)...'
+                    t.status = f'Downloading: Deep Crawl (Depth {depth}/{max_depth} | {len(discovered)}/{max_pages} hal)...'
                     db.session.commit()
 
         if depth < max_depth:
             try:
                 await page.goto(current_url, wait_until='domcontentloaded', timeout=35000)
-                await asyncio.sleep(max(rate_limit_sec, 2.5))
+                await asyncio.sleep(max(rate_limit_sec, 1.8))
                 await prepare_page_for_discovery(page)
 
-                links = await extract_all_links(page)
+                # Aktifkan probing tombol SPA pada depth 0 & 1
+                links = await extract_all_links(page, enable_button_probe=(depth <= 1))
+
+                # Urutkan link: path yang lebih pendek (kategori/menu utama) diprioritaskan lebih dulu
+                links.sort(key=lambda u: len(urlparse(u).path))
+
                 for raw_link in links:
                     raw_clean = raw_link.split('#')[0]
                     norm_link = normalize_url(raw_clean)
@@ -235,8 +302,7 @@ async def bfs_discover_links(page, start_url, max_depth=3, max_pages=50, rate_li
 
     return discovered
 
-async def run_singlefile_cli(target_url, output_html_path, chrome_path):
-    """Menjalankan SingleFile CLI dalam mode headless penuh untuk WSL/root"""
+async def run_singlefile_cli(target_url, output_html_path, chrome_path, cookies_file=None):
     sf_bin = find_singlefile_executable()
     cmd = [
         sf_bin,
@@ -251,6 +317,8 @@ async def run_singlefile_cli(target_url, output_html_path, chrome_path):
     ]
     if chrome_path:
         cmd.append(f"--browser-executable-path={chrome_path}")
+    if cookies_file and os.path.exists(cookies_file):
+        cmd.append(f"--browser-cookies-file={cookies_file}")
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -265,56 +333,82 @@ async def run_singlefile_cli(target_url, output_html_path, chrome_path):
     return True
 
 def rewrite_html_links(html_path, current_url, norm_url_map):
-    """Membersihkan popup modal via BeautifulSoup & mengubah tautan <a> ke file .html lokal"""
+    """Mengubah seluruh tautan lokal agar klik antar-halaman terasa seperti situs asli"""
     if not os.path.exists(html_path):
         return
     with open(html_path, "r", encoding="utf-8", errors="ignore") as f:
         soup = BeautifulSoup(f.read(), "html.parser")
 
+    # Bersihkan overlay/popup penghalang
     for el in soup.select('.modal, .modal-backdrop, .fade.show, [class*="modal"], [class*="backdrop"], [class*="popup"], [class*="overlay"]'):
         el.decompose()
 
     if soup.body:
         soup.body["style"] = "overflow: auto !important; position: static !important;"
 
+    # Hapus <base href="..."> jika disisipkan SingleFile agar path relatif lokal tidak rusak
+    for base_tag in soup.find_all("base"):
+        base_tag.decompose()
+
+    # Tulis ulang seluruh tag <a href="...">
     for a in soup.find_all("a", href=True):
         raw_href = a["href"].strip()
         if raw_href.startswith(("#", "javascript:", "mailto:", "tel:")):
             continue
-        abs_url = urljoin(current_url, raw_href).split("#")[0]
-        norm_href = normalize_url(abs_url)
+
+        abs_url = urljoin(current_url, raw_href)
+        fragment = f"#{urlparse(abs_url).fragment}" if urlparse(abs_url).fragment else ""
+        clean_abs = abs_url.split("#")[0]
+        norm_href = normalize_url(clean_abs)
 
         if norm_href in norm_url_map:
-            a["href"] = norm_url_map[norm_href]
+            a["href"] = f"{norm_url_map[norm_href]}{fragment}"
             if a.has_attr("target"):
                 del a["target"]
         else:
             a["href"] = "javascript:void(0)"
-            a["title"] = "Halaman belum termasuk dalam paket arsip lokal"
+            a["title"] = f"Halaman tidak termasuk dalam batas arsip ({clean_abs})"
+
+    # Tulis ulang atribut onclick yang mengarah ke URL lokal
+    for el in soup.find_all(attrs={"onclick": True}):
+        onclick_val = el["onclick"]
+        matches = re.findall(r"""['"]((?:https?://|/)[^'"]+)['"]""", onclick_val)
+        for m in matches:
+            abs_u = urljoin(current_url, m).split("#")[0]
+            norm_u = normalize_url(abs_u)
+            if norm_u in norm_url_map:
+                onclick_val = onclick_val.replace(m, norm_url_map[norm_u])
+        el["onclick"] = onclick_val
 
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(str(soup))
 
-async def download_site_process(task_id, target_url, output_dir, preview_filename, mode, max_depth=3, max_pages=50, rate_limit=1.5):
+async def download_site_process(task_id, target_url, output_dir, preview_filename, mode, max_depth=4, max_pages=100, rate_limit=1.2):
     with app.app_context():
         task = db.session.get(DownloadTask, task_id)
         if not task:
             return
-        
-        task.status = 'Downloading: Menyiapkan Engine...'
+
+        has_auth = os.path.exists(AUTH_STATE_PATH)
+        task.status = f"Downloading: Menyiapkan Engine ({'Auth Session Aktif' if has_auth else 'Guest'})..."
         db.session.commit()
 
         try:
             os.makedirs(output_dir, exist_ok=True)
             clean_root = target_url.split('#')[0]
             chrome_path = find_chromium_executable()
+            cookies_file = export_cookies_for_singlefile()
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(
-                    viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                )
+                context_kwargs = {
+                    'viewport': {'width': 1920, 'height': 1080},
+                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                }
+                if has_auth:
+                    context_kwargs['storage_state'] = AUTH_STATE_PATH
+
+                context = await browser.new_context(**context_kwargs)
                 page = await context.new_page()
 
                 await page.goto(clean_root, wait_until='domcontentloaded', timeout=60000)
@@ -333,7 +427,7 @@ async def download_site_process(task_id, target_url, output_dir, preview_filenam
                             db.session.commit()
 
                     out_html = os.path.join(output_dir, "index.html")
-                    success = await run_singlefile_cli(clean_root, out_html, chrome_path)
+                    success = await run_singlefile_cli(clean_root, out_html, chrome_path, cookies_file)
                     if success:
                         rewrite_html_links(out_html, clean_root, {normalize_url(clean_root): "index.html"})
                 else:
@@ -349,13 +443,13 @@ async def download_site_process(task_id, target_url, output_dir, preview_filenam
                         with app.app_context():
                             t = db.session.get(DownloadTask, task_id)
                             if t:
-                                t.status = f'Downloading: SingleFile HTML ({idx}/{total_pages} hal)...'
+                                t.status = f'Downloading: Merender Halaman ({idx}/{total_pages})...'
                                 db.session.commit()
 
                         filename = norm_url_map[normalize_url(current_url)]
                         out_html = os.path.join(output_dir, filename)
 
-                        success = await run_singlefile_cli(current_url, out_html, chrome_path)
+                        success = await run_singlefile_cli(current_url, out_html, chrome_path, cookies_file)
                         if success:
                             rewrite_html_links(out_html, current_url, norm_url_map)
 
@@ -365,7 +459,7 @@ async def download_site_process(task_id, target_url, output_dir, preview_filenam
                 if not saved_files:
                     task.status = 'Failed: SingleFile gagal membuat HTML (cek terminal)'
                 else:
-                    task.status = 'Completed'
+                    task.status = f'Completed ({len(saved_files)} Halaman)'
                     task.preview_img = preview_filename
                 db.session.commit()
 
@@ -381,9 +475,9 @@ def index():
     if request.method == 'POST':
         target_url = request.form.get('url')
         download_mode = request.form.get('download_mode', 'single')
-        max_depth = int(request.form.get('max_depth', 3))
-        max_pages = int(request.form.get('max_pages', 50))
-        rate_limit = float(request.form.get('rate_limit', 1.5))
+        max_depth = int(request.form.get('max_depth', 4))
+        max_pages = int(request.form.get('max_pages', 100))
+        rate_limit = float(request.form.get('rate_limit', 1.2))
 
         if target_url:
             if not target_url.startswith('http://') and not target_url.startswith('https://'):
@@ -401,7 +495,7 @@ def index():
 
             import threading
             thread = threading.Thread(
-                target=start_async_download, 
+                target=start_async_download,
                 args=(new_task.id, target_url, target_dir, preview_filename, download_mode, max_depth, max_pages, rate_limit)
             )
             thread.start()
@@ -414,7 +508,6 @@ def index():
 @app.route('/view/<path:folder_name>/')
 @app.route('/view/<path:folder_name>/<path:filename>')
 def view_site(folder_name, filename='index.html'):
-    """Menyajikan file HTML mandiri langsung ke browser dengan navigasi antar-halaman penuh"""
     site_path = os.path.join(DOWNLOAD_FOLDER, folder_name)
     if os.path.exists(os.path.join(site_path, filename)):
         return send_from_directory(site_path, filename)
