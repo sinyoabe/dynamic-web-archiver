@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dynamic Web Archiver & BFS Crawler</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+    <style>
+        body { background-color: #121212; color: #e0e0e0; }
+        .card { background-color: #1e1e1e; border: 1px solid #333; }
+        .form-control, .form-select { background-color: #2b2b2b; color: #fff; border: 1px solid #444; }
+        .form-control:focus, .form-select:focus { background-color: #333; color: #fff; }
+        .preview-img { width: 140px; height: 90px; object-fit: cover; border-radius: 6px; border: 1px solid #555; }
+        .table { color: #e0e0e0; }
+        .mode-box { background: #252525; padding: 15px; border-radius: 8px; border: 1px solid #3d3d3d; }
+    </style>
+</head>
+<body>
+    <div class="container py-5">
+        <h2 class="mb-4 text-center text-danger">🕸️ Dynamic Web Archiver & BFS Crawler</h2>
+        
+        <div class="card p-4 mb-5 shadow">
+            <form method="POST" action="/">
+                <div class="mb-3">
+                    <label for="url" class="form-label fw-bold">Masukkan Alamat Website Target:</label>
+                    <input type="text" class="form-control form-control-lg" id="url" name="url" placeholder="https://contoh-situs.com" required>
+                </div>
+
+                <div class="mb-4 mode-box">
+                    <label class="form-label fw-bold d-flex align-items-center gap-2">
+                        Pilih Mode Arsip:
+                        <i class="bi bi-question-circle-fill text-info" data-bs-toggle="tooltip" title="Single Page untuk 1 halaman presisi, atau Full Mirror untuk penelusuran BFS bertingkat."></i>
+                    </label>
+                    
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <div class="form-check card p-3 h-100" style="cursor: pointer;">
+                                <input class="form-check-input" type="radio" name="download_mode" id="mode_single" value="single" checked onchange="toggleBfsOptions()">
+                                <label class="form-check-label w-100" for="mode_single" style="cursor: pointer;">
+                                    <strong class="text-danger">Single Page Snapshot (.mhtml)</strong>
+                                    <div class="small text-muted mt-1">
+                                        Mengambil 1 halaman utuh dengan visual 100% presisi offline.
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="col-md-6">
+                            <div class="form-check card p-3 h-100" style="cursor: pointer;">
+                                <input class="form-check-input" type="radio" name="download_mode" id="mode_full" value="full" onchange="toggleBfsOptions()">
+                                <label class="form-check-label w-100" for="mode_full" style="cursor: pointer;">
+                                    <strong class="text-primary">Full Website Mirror (BFS Multi-Page)</strong>
+                                    <div class="small text-muted mt-1">
+                                        Penelusuran Breadth-First Search bertingkat dengan kontrol kedalaman dan jeda permintaan aman.
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Pengaturan BFS (Tampil saat Full Mirror dipilih) -->
+                    <div id="bfs-settings" class="row g-3 mt-3 pt-3 border-top border-secondary" style="display: none;">
+                        <div class="col-md-4">
+                            <label class="form-label small fw-bold text-info">Depth Limit (Kedalaman BFS)</label>
+                            <select name="max_depth" class="form-select">
+                                <option value="1">Depth 1 (Hanya link dari halaman utama)</option>
+                                <option value="2" selected>Depth 2 (Halaman utama + sub-menu)</option>
+                                <option value="3">Depth 3 (Penelusuran mendalam)</option>
+                            </select>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label small fw-bold text-info">Batas Maksimal Halaman</label>
+                            <input type="number" name="max_pages" class="form-control" value="25" min="5" max="100">
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label small fw-bold text-info">Rate Limiting (Jeda Detik)</label>
+                            <input type="number" step="0.5" name="rate_limit" class="form-control" value="1.5" min="0.5" max="10">
+                        </div>
+                    </div>
+                </div>
+
+                <button type="submit" class="btn btn-danger btn-lg w-100">Render & Arsipkan Website Target</button>
+            </form>
+        </div>
+
+        <div class="card p-4 shadow">
+            <div class="d-flex justify-content-between align-items-center mb-3">
+                <h4 class="m-0">Daftar Hasil & Preview (Database)</h4>
+                <small id="status-indicator" class="text-muted">● Siap</small>
+            </div>
+            <div class="table-responsive">
+                <table class="table table-dark table-hover align-middle">
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Preview</th>
+                            <th>Target URL & Mode</th>
+                            <th>Waktu Mulai</th>
+                            <th>Status</th>
+                            <th>Aksi</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for task in tasks %}
+                        <tr>
+                            <td>{{ task.id }}</td>
+                            <td>
+                                {% if task.preview_img %}
+                                    <img src="{{ url_for('static', filename='previews/' + task.preview_img) }}" class="preview-img" alt="Preview">
+                                {% else %}
+                                    <span class="badge bg-secondary">Tanpa Preview</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <a href="{{ task.url }}" target="_blank" class="text-info fw-bold">{{ task.url }}</a>
+                                <br>
+                                <small class="badge bg-dark border text-light mt-1">Mode: {{ task.mode.upper() if task.mode else 'SINGLE' }}</small>
+                            </td>
+                            <td>{{ task.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+                            <td>
+                                {% if task.status == 'Completed' %}
+                                    <span class="badge bg-success task-status">Selesai Render</span>
+                                {% elif 'Downloading' in task.status %}
+                                    <span class="badge bg-warning text-dark task-status" data-active="true">{{ task.status }}</span>
+                                {% elif task.status == 'Pending' %}
+                                    <span class="badge bg-secondary task-status" data-active="true">Antrean...</span>
+                                {% else %}
+                                    <span class="badge bg-danger task-status">{{ task.status }}</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if task.status == 'Completed' %}
+                                    <a href="{{ url_for('view_site', folder_name=task.folder_name) }}" target="_blank" class="btn btn-sm btn-outline-success">Buka Hasil Arsip</a>
+                                {% else %}
+                                    <button class="btn btn-sm btn-outline-secondary" disabled>Proses...</button>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% else %}
+                        <tr>
+                            <td colspan="6" class="text-center text-muted">Belum ada riwayat target.</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        const tooltipTriggerList = document.querySelectorAll('[data-bs-toggle="tooltip"]');
+        [...tooltipTriggerList].map(el => new bootstrap.Tooltip(el));
+
+        function toggleBfsOptions() {
+            const isFull = document.getElementById('mode_full').checked;
+            document.getElementById('bfs-settings').style.display = isFull ? 'flex' : 'none';
+        }
+
+        function checkActiveDownloads() {
+            const activeTasks = document.querySelectorAll('.task-status[data-active="true"]');
+            const indicator = document.getElementById('status-indicator');
+
+            if (activeTasks.length > 0) {
+                indicator.className = "text-warning fw-bold";
+                indicator.textContent = "● Sedang Memproses...";
+                setTimeout(() => { location.reload(); }, 3000);
+            } else {
+                indicator.className = "text-success";
+                indicator.textContent = "● Selesai";
+            }
+        }
+
+        document.addEventListener("DOMContentLoaded", () => {
+            toggleBfsOptions();
+            checkActiveDownloads();
+        });
+    </script>
+</body>
+</html>

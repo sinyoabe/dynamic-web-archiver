@@ -1,0 +1,16 @@
+# Virtual Environment
+venv/
+__pycache__/
+*.py[cod]
+
+# Data Sensitif & Sesi Login
+auth.json
+cookies.txt
+.env
+
+# Database & Hasil Render Offline
+downloader.db
+*.sqlite3
+downloads/
+static/previews/*
+!static/previews/.gitkeep
